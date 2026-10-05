@@ -13,11 +13,11 @@
 
 #define PORT      9410                     /* 7000 + 2410 */
 #define SID       "5962"                   /* 2695 reversed */
+#define TOKEN     "OPS-2695"
 #define REG_NO    "IT24102695"
 #define LOG_FILE  "remoteops_" REG_NO ".log"
 #define STORE_DIR "./agentfiles/" REG_NO
 
-/* One lock so two threads never write to the log at the same moment */
 static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Write one timestamped line to the log file and to the screen */
@@ -50,28 +50,125 @@ static void log_event(const char *fmt, ...) {
     pthread_mutex_unlock(&log_lock);
 }
 
-/* Everything we need to know about one client */
+/* Everything we know about one client (its own copy per thread) */
 typedef struct {
-    int  fd;
-    char ip[INET_ADDRSTRLEN];
-    int  port;
+    int    fd;
+    char   ip[INET_ADDRSTRLEN];
+    int    port;
+    char   buf[8192];     /* bytes received but not yet processed */
+    size_t len;           /* how many bytes are in buf */
+    int    authed;        /* 0 until AUTH succeeds */
 } client_t;
+
+/* Keep sending until every byte has gone out */
+static int send_all(int fd, const char *p, size_t len) {
+    while (len > 0) {
+        ssize_t s = send(fd, p, len, MSG_NOSIGNAL);
+        if (s < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        p += s;
+        len -= (size_t)s;
+    }
+    return 0;
+}
+
+/* Send one response line. The SID tag is added here, and only here. */
+static void reply(client_t *c, const char *fmt, ...) {
+    char out[2048];
+    const int cap = (int)sizeof out - 16;     /* leave room for the tag */
+    va_list ap;
+
+    va_start(ap, fmt);
+    int n = vsnprintf(out, (size_t)cap, fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if (n >= cap) n = cap - 1;                /* message was cut short */
+
+    n += snprintf(out + n, sizeof out - (size_t)n, " SID:" SID "\n");
+    send_all(c->fd, out, (size_t)n);
+}
+
+/* Read one full line (up to the \n) into out.
+   Returns 1 = got a line, 0 = client closed, -1 = error or line too long */
+static int read_line(client_t *c, char *out, size_t max) {
+    for (;;) {
+        char *nl = memchr(c->buf, '\n', c->len);
+        if (nl) {
+            size_t n = (size_t)(nl - c->buf);
+            size_t used = n + 1;
+            if (n >= max) n = max - 1;
+            memcpy(out, c->buf, n);
+            out[n] = '\0';
+            if (n > 0 && out[n - 1] == '\r') out[n - 1] = '\0';
+
+            memmove(c->buf, c->buf + used, c->len - used);  /* keep the leftovers */
+            c->len -= used;
+            return 1;
+        }
+        if (c->len == sizeof c->buf) return -1;     /* no newline and buffer full */
+
+        ssize_t r = recv(c->fd, c->buf + c->len, sizeof c->buf - c->len, 0);
+        if (r == 0) return 0;
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        c->len += (size_t)r;
+    }
+}
+
+/* Handle one command line. Returns 0 to carry on, -1 to close the connection. */
+static int handle_line(client_t *c, char *line) {
+    char cmd[32] = "", arg[256] = "";
+    int n = sscanf(line, "%31s %255[^\n]", cmd, arg);
+    if (n < 1) return 0;                          /* empty line: ignore it */
+
+    if (strcmp(cmd, "AUTH") == 0)
+        log_event("CMD %s:%d: AUTH (token hidden)", c->ip, c->port);
+    else
+        log_event("CMD %s:%d: %s", c->ip, c->port, line);
+
+    if (strcmp(cmd, "AUTH") == 0) {
+        if (n < 2) {
+            reply(c, "ERR 007 BAD_ARGUMENTS");
+        } else if (strcmp(arg, TOKEN) == 0) {
+            c->authed = 1;
+            log_event("AUTH OK %s:%d", c->ip, c->port);
+            reply(c, "OK AUTHENTICATED");
+        } else {
+            log_event("AUTH FAILED %s:%d", c->ip, c->port);
+            reply(c, "ERR 001 AUTH_FAILED");
+        }
+        return 0;
+    }
+
+    if (!c->authed) {                             /* everything else needs AUTH first */
+        reply(c, "ERR 003 NOT_AUTHENTICATED");
+        return 0;
+    }
+
+    if (strcmp(cmd, "QUIT") == 0) {
+        reply(c, "OK BYE");
+        return -1;
+    }
+
+    reply(c, "ERR 006 UNKNOWN_COMMAND");
+    return 0;
+}
 
 /* The waiter: runs once per client, in its own thread */
 static void *client_thread(void *arg) {
     client_t *c = (client_t *)arg;
-    char buf[1024];
-    ssize_t n;
+    char line[1024];
 
     log_event("CONNECT %s:%d (fd %d)", c->ip, c->port, c->fd);
 
-    while ((n = recv(c->fd, buf, sizeof buf - 1, 0)) > 0) {
-        buf[n] = '\0';
-        buf[strcspn(buf, "\r\n")] = '\0';
-        log_event("RECV %s:%d: %s", c->ip, c->port, buf);
-
-        char reply[] = "OK HELLO SID:" SID "\n";
-        send(c->fd, reply, strlen(reply), MSG_NOSIGNAL);
+    for (;;) {
+        int r = read_line(c, line, sizeof line);
+        if (r <= 0) break;                        /* client left, or error */
+        if (handle_line(c, line) < 0) break;      /* QUIT */
     }
 
     log_event("DISCONNECT %s:%d (fd %d)", c->ip, c->port, c->fd);
@@ -81,7 +178,7 @@ static void *client_thread(void *arg) {
 }
 
 int main(void) {
-    signal(SIGPIPE, SIG_IGN);   /* a dead client must not kill the Agent */
+    signal(SIGPIPE, SIG_IGN);
 
     if (mkdir("./agentfiles", 0755) < 0 && errno != EEXIST) {
         perror("mkdir agentfiles");
@@ -104,6 +201,7 @@ int main(void) {
 
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
         perror("bind");
+
         return 1;
     }
     listen(server_fd, 10);
@@ -118,7 +216,11 @@ int main(void) {
             continue;
         }
 
-        client_t *c = malloc(sizeof *c);
+        client_t *c = calloc(1, sizeof *c);       /* calloc: len = 0, authed = 0 */
+        if (!c) {
+            close(fd);
+            continue;
+        }
         c->fd = fd;
         inet_ntop(AF_INET, &cli.sin_addr, c->ip, sizeof c->ip);
         c->port = ntohs(cli.sin_port);
