@@ -17,7 +17,8 @@
 #define REG_NO    "IT24102695"
 #define LOG_FILE  "remoteops_" REG_NO ".log"
 #define STORE_DIR "./agentfiles/" REG_NO
-
+#define MAX_FILE_SIZE (10LL * 1024 * 1024)     /* 10 MB upload limit */
+#define DRAIN_LIMIT   (100LL * 1024 * 1024)    /* too-large uploads up to this are read and thrown away */
 static pthread_mutex_t log_lock = PTHREAD_MUTEX_INITIALIZER;
 
 /* Write one timestamped line to the log file and to the screen */
@@ -184,6 +185,151 @@ static int run_cmd(const char *cmd, char *out, size_t max) {
     while (n > 0 && out[n - 1] == ' ') out[--n] = '\0';
     return 0;
 }
+/* Filenames may contain only letters, digits, . _ - and must not start with a dot */
+static int valid_filename(const char *s) {
+    size_t n = strlen(s);
+    if (n == 0 || n > 200 || s[0] == '.') return 0;
+    for (size_t i = 0; i < n; i++) {
+        char ch = s[i];
+        if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
+              (ch >= '0' && ch <= '9') || ch == '.' || ch == '_' || ch == '-'))
+            return 0;
+    }
+    return 1;
+}
+
+/* Read exactly `size` bytes: bytes already in c->buf first, then the socket.
+   f == NULL means read them and throw them away. Returns 0 on success, -1 on error. */
+static int recv_file(client_t *c, FILE *f, long long size) {
+    long long left = size;
+
+    if (c->len > 0 && left > 0) {
+        size_t t = c->len;
+        if ((long long)t > left) t = (size_t)left;
+        if (f && fwrite(c->buf, 1, t, f) != t) return -1;
+        memmove(c->buf, c->buf + t, c->len - t);
+        c->len -= t;
+        left -= (long long)t;
+    }
+
+    char tmp[4096];
+    while (left > 0) {
+        size_t want = left < (long long)sizeof tmp ? (size_t)left : sizeof tmp;
+        ssize_t r = recv(c->fd, tmp, want, 0);
+        if (r == 0) return -1;                       /* client vanished mid-file */
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return -1;
+        }
+        if (f && fwrite(tmp, 1, (size_t)r, f) != (size_t)r) return -1;
+        left -= r;
+    }
+    return 0;
+}
+
+/* PUT <filename> <filesize> followed by <filesize> raw bytes.
+   Returns 0 to carry on, -1 to close the connection. */
+static int do_put(client_t *c, const char *arg) {
+    char fname[256];
+    long long size;
+
+    if (sscanf(arg, "%255s %lld", fname, &size) != 2 || size < 0) {
+        reply(c, "ERR 007 BAD_ARGUMENTS");
+        return -1;                       /* we can't know how many bytes follow */
+    }
+
+    if (size > MAX_FILE_SIZE) {
+        log_event("PUT REJECTED %s:%d: %s too large (%lld bytes)", c->ip, c->port, fname, size);
+        if (size > DRAIN_LIMIT) {
+            reply(c, "ERR 004 FILE_TOO_LARGE");
+            return -1;
+        }
+        if (recv_file(c, NULL, size) < 0) return -1;
+        reply(c, "ERR 004 FILE_TOO_LARGE");
+        return 0;
+    }
+
+    if (!valid_filename(fname)) {
+        log_event("PUT REJECTED %s:%d: bad filename", c->ip, c->port);
+        if (recv_file(c, NULL, size) < 0) return -1;
+        reply(c, "ERR 009 BAD_FILENAME");
+        return 0;
+    }
+
+    char tmp_path[512], final_path[512];
+    snprintf(tmp_path, sizeof tmp_path, STORE_DIR "/.part_%d", c->fd);
+    snprintf(final_path, sizeof final_path, STORE_DIR "/%s", fname);
+
+    FILE *f = fopen(tmp_path, "wb");
+    if (!f) {
+        if (recv_file(c, NULL, size) < 0) return -1;
+        reply(c, "ERR 008 INTERNAL_ERROR");
+        return 0;
+    }
+
+    int rc = recv_file(c, f, size);
+    if (fclose(f) != 0) rc = -1;
+    if (rc < 0) {
+        remove(tmp_path);
+        log_event("PUT FAILED %s:%d: %s (connection lost or disk error)", c->ip, c->port, fname);
+        return -1;
+    }
+
+    if (rename(tmp_path, final_path) < 0) {
+        remove(tmp_path);
+        reply(c, "ERR 008 INTERNAL_ERROR");
+        return 0;
+    }
+
+    log_event("PUT OK %s:%d: %s (%lld bytes)", c->ip, c->port, fname, size);
+    reply(c, "OK FILE_RECEIVED %s", fname);
+    return 0;
+}
+
+/* GET <filename>: header line, then exactly <filesize> raw bytes */
+static int do_get(client_t *c, const char *arg) {
+    char fname[256];
+    if (sscanf(arg, "%255s", fname) != 1) {
+        reply(c, "ERR 007 BAD_ARGUMENTS");
+        return 0;
+    }
+    if (!valid_filename(fname)) {
+        reply(c, "ERR 005 FILE_NOT_FOUND");
+        return 0;
+    }
+
+    char path[512];
+    snprintf(path, sizeof path, STORE_DIR "/%s", fname);
+
+    FILE *f = fopen(path, "rb");
+    struct stat st;
+    if (!f || fstat(fileno(f), &st) < 0 || !S_ISREG(st.st_mode)) {
+        if (f) fclose(f);
+        log_event("GET FAILED %s:%d: %s not found", c->ip, c->port, fname);
+        reply(c, "ERR 005 FILE_NOT_FOUND");
+        return 0;
+    }
+
+    reply(c, "OK FILE_SEND %s %lld", fname, (long long)st.st_size);
+
+    char tmp[4096];
+    long long left = st.st_size;
+    while (left > 0) {
+        size_t want = left < (long long)sizeof tmp ? (size_t)left : sizeof tmp;
+        size_t got = fread(tmp, 1, want, f);
+        if (got == 0) break;
+        if (send_all(c->fd, tmp, got) < 0) {
+            fclose(f);
+            return -1;
+        }
+        left -= (long long)got;
+    }
+    fclose(f);
+    if (left > 0) return -1;             /* file shrank while sending: framing is broken */
+
+    log_event("GET OK %s:%d: %s (%lld bytes)", c->ip, c->port, fname, (long long)st.st_size);
+    return 0;
+}
 /* Handle one command line. Returns 0 to carry on, -1 to close the connection. */
 static int handle_line(client_t *c, char *line) {
     char cmd[32] = "", arg[256] = "";
@@ -209,10 +355,12 @@ static int handle_line(client_t *c, char *line) {
         return 0;
     }
 
-    if (!c->authed) {                             /* everything else needs AUTH first */
+        if (!c->authed) {                             /* everything else needs AUTH first */
         reply(c, "ERR 003 NOT_AUTHENTICATED");
+        if (strcmp(cmd, "PUT") == 0) return -1;   /* its raw bytes would be read as commands */
         return 0;
     }
+
     if (strcmp(cmd, "SYSINFO") == 0) {
         char info[128];
         if (get_sysinfo(info, sizeof info) == 0)
@@ -254,6 +402,21 @@ static int handle_line(client_t *c, char *line) {
         else
             reply(c, "ERR 008 INTERNAL_ERROR");
         return 0;
+    }
+    if (strcmp(cmd, "PUT") == 0) {
+        if (n < 2) {
+            reply(c, "ERR 007 BAD_ARGUMENTS");
+            return -1;
+        }
+        return do_put(c, arg);
+    }
+
+    if (strcmp(cmd, "GET") == 0) {
+        if (n < 2) {
+            reply(c, "ERR 007 BAD_ARGUMENTS");
+            return 0;
+        }
+        return do_get(c, arg);
     }
     if (strcmp(cmd, "QUIT") == 0) {
         reply(c, "OK BYE");
