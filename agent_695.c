@@ -76,7 +76,7 @@ static int send_all(int fd, const char *p, size_t len) {
 
 /* Send one response line. The SID tag is added here, and only here. */
 static void reply(client_t *c, const char *fmt, ...) {
-    char out[2048];
+     char out[8192];
     const int cap = (int)sizeof out - 16;     /* leave room for the tag */
     va_list ap;
 
@@ -118,7 +118,72 @@ static int read_line(client_t *c, char *out, size_t max) {
         c->len += (size_t)r;
     }
 }
+/* SYSINFO: "<cpu_load> <mem_used_mb> <uptime_sec>" from /proc */
+static int get_sysinfo(char *out, size_t max) {
+    double load = 0, up = 0;
+    long total_kb = 0, avail_kb = 0;
+    FILE *f;
 
+    f = fopen("/proc/loadavg", "r");
+    if (!f) return -1;
+    if (fscanf(f, "%lf", &load) != 1) { fclose(f); return -1; }
+    fclose(f);
+
+    f = fopen("/proc/meminfo", "r");
+    if (!f) return -1;
+    char key[64];
+    long val;
+    while (fscanf(f, "%63s %ld", key, &val) == 2) {
+        if (strcmp(key, "MemTotal:") == 0) total_kb = val;
+        else if (strcmp(key, "MemAvailable:") == 0) avail_kb = val;
+        int ch;
+        while ((ch = fgetc(f)) != '\n' && ch != EOF) { }   /* skip rest of line */
+    }
+    fclose(f);
+
+    f = fopen("/proc/uptime", "r");
+    if (!f) return -1;
+    if (fscanf(f, "%lf", &up) != 1) { fclose(f); return -1; }
+    fclose(f);
+
+    snprintf(out, max, "%.2f %ld %ld", load, (total_kb - avail_kb) / 1024, (long)up);
+    return 0;
+}
+
+/* LISTPROC: "pid:name,pid:name,..." on one line */
+static int get_procs(char *out, size_t max) {
+    FILE *p = popen("ps -eo pid,comm --no-headers", "r");
+    if (!p) return -1;
+
+    char line[256];
+    size_t used = 0;
+    out[0] = '\0';
+    while (fgets(line, sizeof line, p)) {
+        int pid;
+        char name[128];
+        if (sscanf(line, "%d %127[^\n]", &pid, name) != 2) continue;
+        for (char *q = name; *q; q++)
+            if (*q == ' ') *q = '_';
+        int w = snprintf(out + used, max - used, "%s%d:%s", used ? "," : "", pid, name);
+        if (w < 0 || (size_t)w >= max - used) break;       /* buffer full: stop */
+        used += (size_t)w;
+    }
+    pclose(p);
+    return 0;
+}
+
+/* EXEC: run one fixed command and squash the output onto one line */
+static int run_cmd(const char *cmd, char *out, size_t max) {
+    FILE *p = popen(cmd, "r");
+    if (!p) return -1;
+    size_t n = fread(out, 1, max - 1, p);
+    pclose(p);
+    out[n] = '\0';
+    for (size_t i = 0; i < n; i++)
+        if (out[i] == '\n' || out[i] == '\r') out[i] = ' ';
+    while (n > 0 && out[n - 1] == ' ') out[--n] = '\0';
+    return 0;
+}
 /* Handle one command line. Returns 0 to carry on, -1 to close the connection. */
 static int handle_line(client_t *c, char *line) {
     char cmd[32] = "", arg[256] = "";
@@ -148,7 +213,48 @@ static int handle_line(client_t *c, char *line) {
         reply(c, "ERR 003 NOT_AUTHENTICATED");
         return 0;
     }
+    if (strcmp(cmd, "SYSINFO") == 0) {
+        char info[128];
+        if (get_sysinfo(info, sizeof info) == 0)
+            reply(c, "OK SYSINFO %s", info);
+        else
+            reply(c, "ERR 008 INTERNAL_ERROR");
+        return 0;
+    }
 
+    if (strcmp(cmd, "LISTPROC") == 0) {
+        char procs[7000];
+        if (get_procs(procs, sizeof procs) == 0)
+            reply(c, "OK PROCS %s", procs);
+        else
+            reply(c, "ERR 008 INTERNAL_ERROR");
+        return 0;
+    }
+
+    if (strcmp(cmd, "EXEC") == 0) {
+        const char *shell_cmd = NULL;
+        if (n < 2) {
+            reply(c, "ERR 007 BAD_ARGUMENTS");
+            return 0;
+        }
+        if      (strcmp(arg, "DATE")     == 0) shell_cmd = "date";
+        else if (strcmp(arg, "UPTIME")   == 0) shell_cmd = "uptime";
+        else if (strcmp(arg, "DISKFREE") == 0) shell_cmd = "df -h /";
+        else if (strcmp(arg, "HOSTNAME") == 0) shell_cmd = "hostname";
+        else if (strcmp(arg, "WHOAMI")   == 0) shell_cmd = "whoami";
+
+        if (!shell_cmd) {
+            log_event("EXEC REJECTED %s:%d: %s", c->ip, c->port, arg);
+            reply(c, "ERR 002 COMMAND_NOT_ALLOWED");
+            return 0;
+        }
+        char result[1024];
+        if (run_cmd(shell_cmd, result, sizeof result) == 0)
+            reply(c, "OK EXEC_RESULT %s", result);
+        else
+            reply(c, "ERR 008 INTERNAL_ERROR");
+        return 0;
+    }
     if (strcmp(cmd, "QUIT") == 0) {
         reply(c, "OK BYE");
         return -1;
