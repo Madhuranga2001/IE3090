@@ -14,3 +14,13 @@
 - Command output is squashed onto one line (newlines become spaces) because the protocol allows one line per response.
 - Tested all five allowed commands and the rejected ones; results as expected.
 
+5 Oct (evening):
+Decisions:
+
+-PUT/GET: after "PUT name size\n" the next <size> bytes are raw data. They can already be in the read buffer, so recv_file() uses those leftover bytes first, then reads the rest from the socket.
+-10 MB limit. A too-large upload is read and discarded (up to 100 MB) so the connection stays usable; beyond that the connection is closed.
+-filenames may only use letters, digits, . _ - and cannot start with a dot, which blocks path traversal like ../evil.txt (ERR 009 BAD_FILENAME).
+-uploads go to a temporary file and are renamed on success, so a dropped connection never leaves a half-written file.
+-PUT before AUTH gets ERR 003 and the connection is closed, because the raw bytes would otherwise be parsed as commands.
+
+
