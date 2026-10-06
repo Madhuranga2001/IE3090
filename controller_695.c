@@ -189,7 +189,8 @@ static int do_put(const char *path) {
         return 0;
     }
     printf("%s\n", resp);
-    print_rate("PUT", sent, t0, t1);
+    if (strncmp(resp, "OK ", 3) == 0)
+        print_rate("PUT", sent, t0, t1);
     return 1;
 }
 
