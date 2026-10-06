@@ -59,6 +59,7 @@ typedef struct {
     char   buf[8192];     /* bytes received but not yet processed */
     size_t len;           /* how many bytes are in buf */
     int    authed;        /* 0 until AUTH succeeds */
+    int    auth_fails;    /* failed AUTH attempts on this connection */
     /* UDP monitoring state (one monitor thread per session) */
     int                mon_running;
     pthread_t          mon_tid;
@@ -302,6 +303,7 @@ static int do_get(client_t *c, const char *arg) {
         return 0;
     }
     if (!valid_filename(fname)) {
+        log_event("GET REJECTED %s:%d: bad filename", c->ip, c->port);
         reply(c, "ERR 005 FILE_NOT_FOUND");
         return 0;
     }
@@ -423,8 +425,13 @@ static int handle_line(client_t *c, char *line) {
             log_event("AUTH OK %s:%d", c->ip, c->port);
             reply(c, "OK AUTHENTICATED");
         } else {
-            log_event("AUTH FAILED %s:%d", c->ip, c->port);
+            c->auth_fails++;
+            log_event("AUTH FAILED %s:%d (attempt %d of 3)", c->ip, c->port, c->auth_fails);
             reply(c, "ERR 001 AUTH_FAILED");
+            if (c->auth_fails >= 3) {
+                log_event("AUTH LOCKOUT %s:%d: too many failed attempts", c->ip, c->port);
+                return -1;                 /* close the connection */
+            }
         }
         return 0;
     }
