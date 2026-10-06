@@ -2,3 +2,4 @@ agent
 controller
 *.log
 agentfiles/
+downloads/
