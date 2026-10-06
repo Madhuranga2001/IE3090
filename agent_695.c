@@ -542,7 +542,7 @@ static void *client_thread(void *arg) {
         if (handle_line(c, line) < 0) break;      /* QUIT */
     }
 
-        mon_stop(c);                        /* QUIT, a dropped client, anything: stop the stream */
+    mon_stop(c);                        /* QUIT, a dropped client, anything: stop the stream */
     log_event("DISCONNECT %s:%d (fd %d)", c->ip, c->port, c->fd);
     close(c->fd);
     pthread_mutex_destroy(&c->mon_lock);
@@ -575,7 +575,6 @@ int main(void) {
 
     if (bind(server_fd, (struct sockaddr *)&addr, sizeof addr) < 0) {
         perror("bind");
-
         return 1;
     }
     listen(server_fd, 10);
