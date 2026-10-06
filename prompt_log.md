@@ -6,3 +6,6 @@
 - 5 Oct: SYSINFO, LISTPROC and a whitelisted EXEC.Tested every command with nc, including rejected EXEC cases (ls, lowercase date, "DATE; ls", no argument). Took screenshots.
 
 -6 Oct : UDP monitoring (MONITOR START/STOP).Applied it as five edits to agent_695.c.The first test showed uneven datagram timing because time(NULL) drops the fractional second; I changed it to clock_gettime. Tested START, STOP, QUIT, Ctrl+C and bad arguments with nc, and checked the stream arrives every 2 seconds.
+-6 oct : 
+- Controller (controller_695.c): an interactive client with PUT/GET and throughput, and a UDP listener thread for MONITOR.
+- Tested all commands, a 5 MB PUT/GET checked with cmp, and five Controllers at once.

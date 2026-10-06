@@ -30,3 +30,9 @@ Decisions:
 - UDP port must be 1024-65535 (ERR 007 otherwise). New error codes: 010 MONITOR_ALREADY_RUNNING, 011 MONITOR_NOT_RUNNING.
 - Problem: the first datagrams were sometimes 1 second apart, because time(NULL) drops the fractional second. Switched to clock_gettime(CLOCK_REALTIME).
 
+6 Oct :
+
+- Controller: reads replies with the same buffered read_line() idea as the Agent, so partial lines and extra bytes are handled.
+- MONITOR START opens the UDP socket and listener thread first, then sends the command, so no datagram is missed. The listener is closed if the Agent refuses, or after STOP or QUIT.
+- Throughput (bytes/s) is measured on the Controller only, so the protocol stays exactly as specified. The loopback figures (113 and 133 MB/s) are not representative of a real network.
+- Tested five Controllers at once; the Agent log shows five overlapping sessions and the Agent kept running.
