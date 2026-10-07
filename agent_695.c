@@ -589,7 +589,7 @@ int main(void) {
             continue;
         }
 
-        client_t *c = calloc(1, sizeof *c);       /* calloc: len = 0, authed = 0 */
+        client_t *c = calloc(1, sizeof *c);       /* calloc: every field starts at 0 */
         if (!c) {
             close(fd);
             continue;
