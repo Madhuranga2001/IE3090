@@ -436,7 +436,7 @@ static int handle_line(client_t *c, char *line) {
         return 0;
     }
 
-        if (!c->authed) {                             /* everything else needs AUTH first */
+    if (!c->authed) {                             /* everything else needs AUTH first */
         reply(c, "ERR 003 NOT_AUTHENTICATED");
         if (strcmp(cmd, "PUT") == 0) return -1;   /* its raw bytes would be read as commands */
         return 0;
