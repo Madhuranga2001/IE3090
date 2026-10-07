@@ -36,3 +36,9 @@ Decisions:
 - MONITOR START opens the UDP socket and listener thread first, then sends the command, so no datagram is missed. The listener is closed if the Agent refuses, or after STOP or QUIT.
 - Throughput (bytes/s) is measured on the Controller only, so the protocol stays exactly as specified. The loopback figures (113 and 133 MB/s) are not representative of a real network.
 - Tested five Controllers at once; the Agent log shows five overlapping sessions and the Agent kept running.
+- Final test pass on a clean clone of the repo (so no leftover files could hide a bug). All of T1-T18 passed. Two real problems found: unlimited AUTH attempts per connection (fixed with a 3-attempt lockout) and the Controller printing a speed after a rejected upload (fixed). Obstacle: terminal screenshots kept cutting off the commands; solved with a helper that prints the exact input sent.
+
+
+7 Oct :
+
+- Annotated code screenshots. Wrote the Implementation Report, reflection and these notes. Commit dates: the early commits show -0400 because the VM clock was on a US time zone until I changed it to Asia/Colombo; git stores the absolute time, so the history is correct.

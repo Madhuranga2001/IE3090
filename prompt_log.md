@@ -9,3 +9,7 @@
 -6 oct : 
 - Controller (controller_695.c): an interactive client with PUT/GET and throughput, and a UDP listener thread for MONITOR.
 - Tested all commands, a 5 MB PUT/GET checked with cmp, and five Controllers at once.
+
+-7 Oct : final testing and report
+- Whitespace and comment fixes (commits 7d21c2e, a151d17, 5658059). My first edit of line 439 removed the wrong spaces; I fixed it with sed.
+
